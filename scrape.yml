@@ -1,0 +1,45 @@
+name: AnimeZone Scraper
+
+on:
+  schedule:
+    # Cron toutes les 6 heures (minuit, 6h, midi, 18h UTC)
+    - cron: '0 */6 * * *'
+  # Permet de lancer manuellement depuis l'onglet Actions
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # 6h max (on en utilise ~3h)
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python scrap.py --hf $HF_TOKEN --pull --push
+
+      - name: Commit state.json back to repo (cache)
+        # Optionnel : garde une copie du state dans le repo pour debug
+        # Mais la source de vérité reste HuggingFace
+        run: |
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+          if [ -f state.json ]; then
+            git add state.json || true
+            git commit -m "chore: update state.json [skip ci]" || true
+            git push || true
+          fi
