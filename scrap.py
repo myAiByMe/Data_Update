@@ -452,6 +452,7 @@ async def fetch_all_catalogues(
     seen_urls: set[str] = set()
     page = 1
     scans_filtered = 0
+    consecutive_empty = 0  # Sécurité anti-boucle
 
     while True:
         if max_animes and len(all_catalogues) >= max_animes:
@@ -473,17 +474,41 @@ async def fetch_all_catalogues(
             break
 
         new_count = 0
+        new_urls_this_page = 0
         for cat in page_catalogues:
+            # Vérifier si l'URL est un doublon
+            is_new_url = cat["url"] not in seen_urls
+            if is_new_url:
+                new_urls_this_page += 1
+                seen_urls.add(cat["url"])
+
             cats = cat.get("categories", set())
             if not (cats & {"Anime", "Film"}):
                 scans_filtered += 1
                 continue
-            if cat["url"] not in seen_urls:
-                seen_urls.add(cat["url"])
+
+            if is_new_url:
                 all_catalogues.append(cat)
                 new_count += 1
 
         log.info("Page %d : %d nouveaux (%d total, %d scans filtrés)", page, new_count, len(all_catalogues), scans_filtered)
+
+        # ===== NOUVELLES CONDITIONS D'ARRÊT =====
+        # 1) La page ne contenait que des URLs déjà vues → on boucle
+        if new_urls_this_page == 0:
+            log.info("Page %d : 0 nouvel URL — pagination bouclée, arrêt", page)
+            break
+
+        # 2) Sécurité : si on enchaîne 10 pages sans aucun nouvel anime, on stoppe
+        if new_count == 0:
+            consecutive_empty += 1
+            if consecutive_empty >= 10:
+                log.info("Page %d : 10 pages consécutives sans nouvel anime — arrêt", page)
+                break
+        else:
+            consecutive_empty = 0
+        # ========================================
+
         page += 1
 
     if max_animes:
@@ -755,10 +780,6 @@ def load_state(state_path: str) -> dict:
     return {
         "last_full_scrape": 0,
         "last_incremental_scrape": 0,
-        # V2.15 : on garde le cache URL → {anime_id, name, last_scraped, data}
-        # mais anime_id est désormais calculé via stable_anime_id(url), pas via
-        # un compteur. Le cache sert uniquement à skip les animes déjà scrapés
-        # récemment (si on veut faire du增量).
         "animes_scraped": {},
         "catalogue_seen_urls": [],
     }
@@ -782,7 +803,6 @@ def write_db(db_path: str, animes: list[dict]):
         conn.executescript(SCHEMA)
     else:
         log.info("Mise à jour incrémentale de la DB %s ...", db_path)
-        # Migration : ajouter la colonne alternative_titles si elle n'existe pas
         try:
             cols = [row[1] for row in conn.execute("PRAGMA table_info(anime)").fetchall()]
             if "alternative_titles" not in cols:
@@ -791,9 +811,6 @@ def write_db(db_path: str, animes: list[dict]):
         except Exception as e:
             log.warning("Migration alternative_titles: %s", e)
     c = conn.cursor()
-    # V2.15 : on vide toutes les tables avant de re-remplir pour éviter les
-    # restes d'anciens IDs. Comme les IDs sont désormais stables, le INSERT OR
-    # REPLACE aurait suffit, mais un TRUNCATE est plus propre.
     for table in ["episode_url", "episode", "season", "anime_genre", "anime", "genre", "discover"]:
         c.execute(f"DELETE FROM {table}")
     conn.commit()
@@ -842,7 +859,6 @@ def _upsert_anime(c, anime: dict):
         genre_id = c.execute("SELECT id FROM genre WHERE name_normalized = ?", (genre_norm,)).fetchone()[0]
         c.execute("INSERT OR IGNORE INTO anime_genre (anime_id, genre_id) VALUES (?, ?)", (int(anime_id), genre_id))
 
-    # V2.15 : on DELETE par anime_id (stable désormais, pas de risque de résidu)
     season_ids = [row[0] for row in c.execute("SELECT id FROM season WHERE anime_id = ?", (int(anime_id),))]
     if season_ids:
         placeholders = ",".join("?" * len(season_ids))
@@ -923,9 +939,6 @@ async def run_scraper(args):
             log.error("Catalogue vide — abandon")
             return
 
-        # V2.15 : tous les animes du catalogue sont scrapés (le state ne sert
-        # plus qu'au cache). On peut ajouter une option --incremental plus tard
-        # pour skip les animes scrapés il y a moins de X heures.
         catalogues_to_scrape = all_catalogues
         if max_animes:
             catalogues_to_scrape = catalogues_to_scrape[:max_animes]
@@ -945,7 +958,6 @@ async def run_scraper(args):
         )
         for idx, cat in enumerate(pbar, start=1):
             url = cat["url"]
-            # V2.15 : anime_id STABLE via hash MD5 de l'URL
             anime_id = stable_anime_id(url)
             state["animes_scraped"][url] = {
                 "anime_id": anime_id,
@@ -1027,7 +1039,6 @@ def main():
     parser.add_argument("--max-animes", type=int, default=None, help="Limite (pour test)")
     parser.add_argument("--no-scrap", action="store_true", help="Convertir state → DB sans scraper")
 
-    # Options HuggingFace sync
     parser.add_argument("--hf", help="Token HuggingFace pour sync cloud")
     parser.add_argument("--repo", default="animezone-catalog", help="Nom du repo HF")
     parser.add_argument("--push", action="store_true", help="Push DB + state sur HF a la fin")
@@ -1035,7 +1046,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Setup HF si token fourni
     hf_api = None
     hf_repo = ""
     if args.hf:
@@ -1050,7 +1060,6 @@ def main():
             log.error("Erreur init HF: %s", e)
             hf_api = None
 
-    # Pull state depuis HF si demandé
     if args.pull and hf_api:
         try:
             log.info("Telechargement state.json depuis HF ...")
@@ -1063,7 +1072,6 @@ def main():
 
     asyncio.run(run_scraper(args))
 
-    # Push vers HF si demandé
     if args.push and hf_api:
         log.info("Push des resultats sur HF ...")
         if os.path.exists(args.db):
@@ -1072,12 +1080,10 @@ def main():
         if os.path.exists(args.state):
             hf_api.upload_file(path_or_fileobj=args.state, path_in_repo="state.json", repo_id=hf_repo, repo_type="dataset")
             log.info("✓ state.json pousse")
-        # Generer et pousser le manifest
         import sqlite3, time
         if os.path.exists(args.db):
             conn = sqlite3.connect(args.db)
             c = conn.cursor()
-            # V2.15 : calcul du SHA256 de la DB pour vérification d'intégrité côté app
             import hashlib as _hl
             sha256 = _hl.sha256()
             with open(args.db, "rb") as f:
