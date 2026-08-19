@@ -2,8 +2,9 @@ name: AnimeZone Scraper
 
 on:
   schedule:
-    # Cron toutes les 6 heures (minuit, 6h, midi, 18h UTC)
-    - cron: '0 */6 * * *'
+    # Cron hebdomadaire — tous les lundis à 03:00 UTC (~05:00 Paris)
+    # Évite le pic de charge de minuit (tout le monde schedule à 00:00)
+    - cron: '0 3 * * 1'
   # Permet de lancer manuellement depuis l'onglet Actions
   workflow_dispatch:
 
@@ -11,6 +12,8 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 360 # 6h max (on en utilise ~3h)
+    permissions:
+      contents: write  # Requis pour le git push final (commit state.json)
 
     steps:
       - name: Checkout code
@@ -26,11 +29,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Verify HF_TOKEN is set
+        # Évite de lancer le scraper pour rien si le secret est vide
+        # (arrive souvent quand on oublie de créer le secret)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "❌ HF_TOKEN est vide ! Crée le secret dans Settings → Secrets → Actions"
+            exit 1
+          fi
+          echo "✓ HF_TOKEN présent (${#HF_TOKEN} chars)"
+
       - name: Run scraper
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          python scrap.py --hf $HF_TOKEN --pull --push
+          python scrap.py --hf "$HF_TOKEN" --pull --push
 
       - name: Commit state.json back to repo (cache)
         # Optionnel : garde une copie du state dans le repo pour debug
