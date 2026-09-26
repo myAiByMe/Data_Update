@@ -67,6 +67,14 @@ jobs:
           fi
           echo "✓ HF_TOKEN présent (${#HF_TOKEN} chars)"
 
+      - name: Rendre state.json inscriptible
+        # Un state.json committé peut être checkouté en lecture seule
+        # (Errno 13 constaté après 97 min de scrape perdues). Le chmod
+        # garantit que le run peut sauvegarder. Idempotent, sans risque.
+        run: |
+          chmod u+w state.json 2>/dev/null || true
+          ls -la state.json || echo "pas de state.json dans le repo (normal si 1er run)"
+
       - name: Run scraper (fallback auto anti-403)
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
