@@ -27,6 +27,7 @@ import random
 import re
 import sqlite3
 import sys
+import tempfile
 import time
 import unicodedata
 from ast import literal_eval
@@ -810,25 +811,80 @@ async def scrape_anime(
 # ==================================================================
 # State — utilisé uniquement pour le cache (last_scraped), plus pour les IDs
 # ==================================================================
+# v2.7 — auto-réparation images : les vieux state.json pointent vers les
+# thumbnails basse résolution (/contenu/thumb/<slug>.webp, ~15 Ko) que
+# anime-sama sert maintenant sur ses cards. Réécrit vers les posters HD
+# (/contenu/<slug>.jpg) au chargement — couverture validée à 100% sur le
+# catalogue. Conséquence : même si HuggingFace contient un vieux state
+# avec thumbs, TOUTE DB régénérée est HD, sans intervention manuelle.
+THUMB_HD_RE = re.compile(r"/contenu/thumb/([^/]+)\.webp$")
+
+
+def migrate_state_images(state: dict) -> int:
+    """Réécrit les URLs d'images thumb → posters HD. Retourne le nb de fixes."""
+    n = 0
+    for v in state.get("animes_scraped", {}).values():
+        d = v.get("data", {})
+        for field in ("image", "image_url"):
+            url = d.get(field, "")
+            if url and "/contenu/thumb/" in url:
+                d[field] = THUMB_HD_RE.sub(r"/contenu/\1.jpg", url)
+                n += 1
+    return n
+
+
 def load_state(state_path: str) -> dict:
-    if os.path.exists(state_path):
-        try:
-            with open(state_path, encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {
+    state = {
         "last_full_scrape": 0,
         "last_incremental_scrape": 0,
         "animes_scraped": {},
         "catalogue_seen_urls": [],
     }
+    if os.path.exists(state_path):
+        try:
+            with open(state_path, encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception:
+            pass
+    migrated = migrate_state_images(state)
+    if migrated:
+        log.info("Auto-migration images : %d URLs thumb -> posters HD", migrated)
+        # persiste tout de suite (sans toucher last_incremental_scrape)
+        try:
+            _write_json_file(state_path, state)
+        except OSError as e:
+            log.warning("State migré non persisté à chaud (%s) — il sera sauvegardé "
+                        "par les checkpoints du run", e)
+    return state
+
+
+def _write_json_file(path: str, state: dict):
+    """Écriture ATOMIQUE : fichier temporaire + os.replace.
+    Un rename(2) ne demande PAS la permission d'écriture sur le fichier
+    cible, seulement sur le répertoire — contourne donc un state.json en
+    lecture seule (Errno 13 constaté sur GitHub Actions : 97 min de scrape
+    perdus). De plus, jamais de fichier à moitié écrit en cas de crash."""
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
 
 def save_state(state_path: str, state: dict):
     state["last_incremental_scrape"] = int(time.time())
-    with open(state_path, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+    try:
+        _write_json_file(state_path, state)
+    except OSError as e:
+        # cas extrême : répertoire lui-même non inscriptible → secours tempdir
+        fallback = os.path.join(tempfile.gettempdir(),
+                                os.path.basename(state_path) or "state.json")
+        log.critical("Impossible d'écrire %s (%s) — state sauvegardé en secours : %s",
+                     state_path, e, fallback)
+        try:
+            _write_json_file(fallback, state)
+        except OSError as e2:
+            log.critical("Secours également impossible (%s) — state uniquement en mémoire",
+                         e2)
 
 
 def write_db(db_path: str, animes: list[dict]):
@@ -1107,8 +1163,11 @@ def main():
             import shutil
             shutil.copy(path, args.state)
             log.info("✓ state.json recupere")
-        except Exception:
-            log.info("Pas de state.json sur HF — demarrage from scratch")
+        except Exception as e:
+            # NE PAS avaler silencieusement : un PermissionError ici signifierait
+            # que le state local est read-only et tout le run serait à risque
+            log.warning("Pull HF impossible (%s: %s) — demarrage avec le state local",
+                        type(e).__name__, e)
 
     asyncio.run(run_scraper(args))
 
