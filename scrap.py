@@ -207,16 +207,53 @@ def extract_host(url: str) -> str:
     if "youtube" in host:        return "youtube"
     if "tune" in host or "hydrax" in host: return "hydrax"
     if "uqload" in host:         return "uqload"
+    # v2.6 — nouveaux hosts anime-sama (2025) : embeds "modernes"
+    if "ansembed" in host:       return "ansembed"
+    if "embed4me" in host:       return "embed4me"
+    if "oneupload" in host:      return "oneupload"
+    if "movearnpre" in host:     return "movearnpre"
+    if "myvi" in host:           return "myvi"
     return host or "unknown"
+
+
+# Ordre de lecture des lecteurs, demandé par l'utilisateur (2025-09-26) :
+#   1. ansembed   (le remplaçant de vidmoly — même format d'embed)
+#   2. embed4me
+#   3. sibnet
+#   4. sendvid
+# Tout le reste suit en conservant son ordre d'origine (tri stable).
+PLAYER_PRIORITY = ["ansembed", "embed4me", "sibnet", "sendvid"]
+
+
+def player_sort_key(item: dict) -> int:
+    """Clé de tri d'une URL player selon PLAYER_PRIORITY (matching par contient)."""
+    h = item.get("host", "")
+    for i, p in enumerate(PLAYER_PRIORITY):
+        if p in h:
+            return i
+    return len(PLAYER_PRIORITY)
 
 
 def fix_image_url(url: str) -> str:
     if not url:
         return url
-    return url.replace(
+    # 1) CDN statically.io -> raw.githubusercontent (ancien comportement)
+    url = url.replace(
         "cdn.statically.io/gh/Anime-Sama/IMG/img",
         "raw.githubusercontent.com/Anime-Sama/IMG/img",
     )
+    # 2) v2.6 — le catalogue anime-sama sert maintenant des THUMBNAILS basse
+    #    résolution dans ses cards : /contenu/thumb/<slug>.webp (~5-45 Ko).
+    #    Le poster pleine résolution existe dans le même repo GitHub :
+    #    /contenu/<slug>.jpg (~100 Ko - 1.6 Mo). On réécrit vers le poster
+    #    pour que les cards de l'app affichent la qualité d'origine.
+    #    (Vérifié le 2025-09-26 : 25/25 posters HD présents sur échantillon)
+    url = re.sub(
+        r"/contenu/thumb/([^/]+)\.webp$",
+        r"/contenu/\1.jpg",
+        url,
+    )
+    return url
 
 
 def remove_some_js_comments(string: str) -> str:
@@ -724,7 +761,10 @@ async def scrape_anime(
             ep_langs = []
             for lang, eps_list in lang_episodes.items():
                 if ep_idx < len(eps_list) and eps_list[ep_idx]:
-                    ep_urls[lang] = [{"host": extract_host(u), "url": u} for u in eps_list[ep_idx]]
+                    ep_urls[lang] = sorted(
+                        ({"host": extract_host(u), "url": u} for u in eps_list[ep_idx]),
+                        key=player_sort_key,
+                    )
                     ep_langs.append(lang)
             if ep_urls:
                 episodes_out.append({

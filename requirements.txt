@@ -1,5 +1,14 @@
+# ── scrap.py (scraper classique) ──
 cloudscraper>=1.2.71
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
 tqdm>=4.65.0
 huggingface_hub>=0.20.0
+
+# ── scrap_experimental.py (fallback anti-Cloudflare) ──
+# curl_cffi = impersonation TLS/JA3 Chrome (indispensable anti-403)
+curl_cffi>=0.7.0
+requests>=2.31.0
+# playwright = navigateur intégré si FlareSolverr absent
+# (sur GitHub Actions, exécuter ensuite : python -m playwright install --with-deps chromium)
+playwright>=1.40.0
