@@ -1,17 +1,41 @@
+# AnimeZone Scraper — avec fallback anti-Cloudflare automatique
+#
+# ⚠️ CE FICHIER DOIT ÊTRE DANS : .github/workflows/scrape.yml
+#    (« workflows » avec un S — dossier caché car commence par un point)
+#
+# Chaîne : run_scrape.py lance scrap.py (cloudscraper).
+#   Si Cloudflare bloque (403 / pages perdues / catalogue vide)
+#   → bascule AUTOMATIQUE sur scrap_experimental.py :
+#     1. curl_cffi (impersonation Chrome, TLS/JA3)
+#     2. cookies cf_clearance via navigateur Playwright intégré
+#     3. ProxyStream : rotation d'IP via proxys HTTP publics
+#        (validateur continu en tâche de fond, tri par vitesse) ← testé ✅
+#     4. relais publics (allorigins → codetabs → r.jina.ai) en dernier
+#   Le push HuggingFace ne se fait qu'avec une DB propre :
+#     - scrap.py a réussi → push via --no-scrap (zéro requête anime-sama)
+#     - fallback réussi  → push direct par scrap_experimental.py
+#   Le state.json enrichi par scrap.py avant le 403 est PRÉSERVÉ
+#   (le fallback retire --pull pour ne pas l'écraser par la version HF).
+
 name: AnimeZone Scraper
 
 on:
   schedule:
-    # Cron hebdomadaire — tous les lundis à 03:00 UTC (~05:00 Paris)
-    # Évite le pic de charge de minuit (tout le monde schedule à 00:00)
-    - cron: '0 3 * * 1'
+    # 1 scrape par jour à 04:00 UTC (~06:00 Paris)
+    # (ton ancien rythme hebdo si tu veux revenir : '0 3 * * 1')
+    - cron: '0 4 * * *'
   # Permet de lancer manuellement depuis l'onglet Actions
   workflow_dispatch:
+    inputs:
+      max_animes:
+        description: "Limiter le nombre d'animes (0 = tout scrapper)"
+        required: false
+        default: "0"
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 360 # 6h max (on en utilise ~3h)
+    timeout-minutes: 360 # 6h max (on en utilise ~3h, + fallback si 403)
     permissions:
       contents: write  # Requis pour le git push final (commit state.json)
 
@@ -28,6 +52,8 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          # Chromium : navigateur intégré du fallback scrap_experimental.py
+          python -m playwright install --with-deps chromium
 
       - name: Verify HF_TOKEN is set
         # Évite de lancer le scraper pour rien si le secret est vide
@@ -41,15 +67,32 @@ jobs:
           fi
           echo "✓ HF_TOKEN présent (${#HF_TOKEN} chars)"
 
-      - name: Run scraper
+      - name: Run scraper (fallback auto anti-403)
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          python scrap.py --hf "$HF_TOKEN" --pull --push
+          ARGS="--hf $HF_TOKEN --pull --push"
+          MAX="${{ github.event.inputs.max_animes }}"
+          if [ -n "$MAX" ] && [ "$MAX" != "0" ]; then
+            ARGS="$ARGS --max-animes $MAX"
+          fi
+          python run_scrape.py $ARGS
+
+      - name: Backup artifacts (si le push HF échoue)
+        # Récupérable même si le job échoue : DB + state sauvegardés
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: animezone-db
+          path: |
+            animezone.db
+            state.json
+          retention-days: 14
 
       - name: Commit state.json back to repo (cache)
         # Optionnel : garde une copie du state dans le repo pour debug
         # Mais la source de vérité reste HuggingFace
+        if: success()
         run: |
           git config --global user.name "GitHub Action"
           git config --global user.email "action@github.com"
