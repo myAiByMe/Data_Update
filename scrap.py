@@ -1,6 +1,24 @@
 #!/usr/bin/env python3
 """Scraper Anime-Sama (anime-sama.to) avec cloudscraper.
 
+V2.16 — Fix « Aucun domaine Anime-Sama accessible » après redesign oct. 2026 :
+  - Détection de domaine design-INDÉPENDANTE : on ne compte plus
+    'class="card-title"' (marqueur disparu avec le redesign) mais on valide
+    que la page répond, n'est pas un challenge Cloudflare, et s'identifie
+    comme anime-sama (nom du site / liens /catalogue/).
+  - Domaine canonique résolu via l'URL FINALE après redirection (les
+    miroirs .si/.tv/.org redirigent vers .to) → URLs stables → anime_id
+    stables, quel que soit le domaine qui répond.
+  - Domaines DNS-morts (.eu) détectés → skip immédiat, zéro retry.
+  - parse_catalogue_page : fallback générique si les classes strictes
+    (catalog-card/card-title) disparaissent + dump debug_catalogue_*.html
+    pour adapter les sélecteurs depuis l'artefact CI.
+  - Garde anti-corruption : si le redesign casse la détection de saisons,
+    les saisons précédentes du state sont CONSERVÉES (jamais écrasées par
+    des données vides).
+  - Fix faux succès : échec → exit 1 + push de state.json seul (jamais
+    d'une DB partielle). run_scrape/CI voient enfin l'échec.
+
 V2.15 — Stable anime_id via hash MD5 de l'URL.
   - anime_id = int.from_bytes(md5(url).digest()[:4], 'big')
   - Avant : compteur séquentiel (next_anime_id) → IDs instables entre runs
@@ -33,7 +51,7 @@ import unicodedata
 from ast import literal_eval
 from html import unescape
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import cloudscraper
 from bs4 import BeautifulSoup
@@ -138,6 +156,21 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
+
+# V2.16 — ordre = fiabilité constatée (oct. 2026) : .to est le canonique
+# (tous les miroirs y redirigent), .eu est DNS-mort mais coûte ~0 désormais
+# (skip immédiat sans retry).
+DOMAIN_LIST = [
+    "https://anime-sama.to/",
+    "https://anime-sama.si/",
+    "https://anime-sama.tv/",
+    "https://anime-sama.org/",
+    "https://anime-sama.eu/",
+]
+
+# Marqueurs du design 2025 (cards du catalogue). Utilisés uniquement pour
+# l'observabilité (log + dump debug) — plus pour la décision de vie/mort.
+CARD_MARKERS = ['class="card-title"', "catalog-card", "card-base"]
 
 
 # ==================================================================
@@ -318,7 +351,10 @@ class ScraperClient:
                         continue
                     title_match = re.search(r"<title>([^<]+)</title>", resp.text, re.IGNORECASE)
                     title = title_match.group(1).lower() if title_match else ""
-                    if "blocked" in title or "attention required" in title:
+                    # V2.16 — "just a moment" ajouté (interstitiel CF qui
+                    # passait au travers et était renvoyé comme du HTML ok)
+                    if ("blocked" in title or "attention required" in title
+                            or "just a moment" in title):
                         wait = 5 + attempt * 5
                         log.warning("Cloudflare block sur %s — retry dans %ds", url, wait)
                         await asyncio.sleep(wait)
@@ -334,6 +370,16 @@ class ScraperClient:
                             continue
                     return text
                 except Exception as e:
+                    # V2.16 — échec DNS = déterministe (domaine mort) : retry
+                    # inutile (economisait ~13 s/run sur .eu, 3 retries × backoff)
+                    msg = str(e).lower()
+                    if ("name or service not known" in msg
+                            or "getaddrinfo failed" in msg
+                            or "nodename nor servname" in msg
+                            or "no address associated" in msg):
+                        host = urlparse(url).netloc or url
+                        log.error("DNS introuvable pour %s — domaine mort, skip", host)
+                        return ""
                     wait = 2 ** attempt + random.uniform(0, 1)
                     log.warning("Erreur réseau sur %s: %s — retry dans %.1fs", url, e, wait)
                     await asyncio.sleep(wait)
@@ -348,35 +394,112 @@ class ScraperClient:
                 pass
 
 
-async def find_site_url(client: ScraperClient) -> str | None:
-    log.info("Recherche du domaine actif via anime-sama.org ...")
-    test_url = "https://anime-sama.org/catalogue/?search="
-    html = await client.get(test_url)
-    if html and html.count('class="card-title"') > 0:
-        try:
-            final_url = await asyncio.to_thread(
-                lambda: client._sessions[0].get(test_url, allow_redirects=True).url
-            )
-            parsed = urlparse(str(final_url))
-            site_url = f"{parsed.scheme}://{parsed.netloc}/"
-            log.info("  ✓ Domaine actif : %s", site_url)
-            return site_url
-        except Exception:
-            return "https://anime-sama.org/"
+# ------------------------------------------------------------------
+# V2.16 — Détection de domaine design-indépendante
+# ------------------------------------------------------------------
+def _is_cf_challenge(text: str) -> bool:
+    t = text.lower()
+    return ("just a moment" in t or "attention required" in t
+            or "challenge-platform" in t or "cf-browser-verification" in t)
 
-    log.warning("anime-sama.org inaccessible — fallback liste codée en dur")
-    for url in [
-        "https://anime-sama.to/",
-        "https://anime-sama.si/",
-        "https://anime-sama.tv/",
-        "https://anime-sama.eu/",
-        "https://anime-sama.org/",
-    ]:
+
+def _page_alive(html: str) -> bool:
+    """Vrai si `html` est une vraie page anime-sama, INDÉPENDAMMENT du design.
+
+    L'ancien test comptait 'class=\"card-title\"' : le redesign d'oct. 2026 a
+    fait disparaître ce marqueur de la page /catalogue/?search= → tous les
+    domaines semblaient morts alors que le site répondait parfaitement
+    (logs du 2026-10-28 : chaque domaine répond en ~1 s, zéro challenge CF,
+    mais 0 marqueur → « Aucun domaine accessible »).
+
+    Nouveau critère : page non vide (> 3 Ko), pas un challenge Cloudflare,
+    et identifiable comme anime-sama (nom du site ou liens /catalogue/).
+    """
+    if not html or len(html) < 3000:
+        return False
+    if _is_cf_challenge(html):
+        return False
+    low = html.lower()
+    return ("anime-sama" in low) or ("/catalogue/" in low)
+
+
+def _dump_debug_html(html: str, tag: str):
+    """Sauve un échantillon HTML + résumé des classes CSS présentes.
+
+    Objectif : si le design re-change, le prochain run CI produit un artefact
+    debug_catalogue_<host>.html + la liste des classes les plus fréquentes
+    directement dans les logs → on adapte parse_catalogue_page sans deviner.
+    """
+    try:
+        fn = f"debug_catalogue_{tag}.html"
+        with open(fn, "w", encoding="utf-8", errors="replace") as f:
+            f.write(html[:300_000])
+        title_m = re.search(r"<title>([^<]+)</title>", html, re.IGNORECASE)
+        classes: dict[str, int] = {}
+        for m in re.findall(r'class="([^"]{2,120})"', html):
+            for cl in m.split():
+                if len(cl) > 40:   # hash/hash-classes tailwind → bruit
+                    continue
+                classes[cl] = classes.get(cl, 0) + 1
+        top = sorted(classes.items(), key=lambda kv: -kv[1])[:25]
+        log.warning("  DEBUG title=%r", title_m.group(1) if title_m else "(aucun)")
+        log.warning("  DEBUG classes les plus fréquentes : %s",
+                    ", ".join(f"{c}({n})" for c, n in top))
+        log.warning("  → échantillon sauvé : %s (adapter parse_catalogue_page "
+                    "si les sélecteurs stricts ne trouvent plus rien)", fn)
+    except Exception:
+        pass
+
+
+def _resolve_canonical(client, test_url: str, fallback: str) -> str:
+    """Suit la redirection du test et retourne l'ORIGINE finale.
+
+    Les miroirs .si/.tv/.org redirigent /catalogue/?search= vers .to :
+    scraper depuis l'origine finale garantit des URLs identiques quel que
+    soit le domaine qui a répondu → anime_id stables (hash MD5 de l'URL).
+    Sans ça, un run via .si générerait des IDs différents de tous les
+    précédents → catalogue entier « nouveau » côté app.
+    """
+    try:
+        resp = client._sessions[0].get(test_url, allow_redirects=True, timeout=30)
+        u = str(resp.url)
+        p = urlparse(u)
+        if p.netloc:
+            return f"{p.scheme}://{p.netloc}/"
+    except Exception as e:
+        log.warning("Résolution canonique impossible (%s: %s) — usage de %s",
+                    type(e).__name__, e, fallback)
+    return fallback
+
+
+async def find_site_url(client: ScraperClient) -> str | None:
+    """V2.16 — trouve un domaine vivant via un test design-indépendant."""
+    log.info("Recherche du domaine actif (test /catalogue/?search=, "
+             "détection indépendante du design) ...")
+    debug_dumped = False
+    for url in DOMAIN_LIST:
         log.info("Test domaine %s ...", url)
-        html_test = await client.get(url + "catalogue/?search=")
-        if html_test and html_test.count('class="card-title"') > 0:
-            log.info("  ✓ Domaine actif : %s", url)
-            return url
+        test_url = url + "catalogue/?search="
+        html = await client.get(test_url)
+        if not _page_alive(html):
+            log.info("  ✗ %s inaccessible (offline / challenge CF / page vide)", url)
+            continue
+
+        # Vivant → canonique via redirection (ex: .si → .to)
+        site_url = _resolve_canonical(client, test_url, url)
+
+        # Observabilité : le site répond mais les marqueurs cartes 2025 ont
+        # disparu → alerte + dump pour adapter le parser avant le prochain run
+        old_markers = [m for m in CARD_MARKERS if html.count(m) > 0]
+        if not old_markers and not debug_dumped:
+            log.warning("  ⚠ %s répond mais 0 marqueur carte connu "
+                        "(card-title/catalog-card) — design changé ?", site_url)
+            _dump_debug_html(html, urlparse(site_url).netloc.replace(".", "_"))
+            debug_dumped = True
+
+        log.info("  ✓ Domaine actif : %s (marqueurs: %s)", site_url,
+                 ", ".join(old_markers) if old_markers else "AUCUN (redesign)")
+        return site_url
     log.error("Aucun domaine Anime-Sama accessible")
     return None
 
@@ -479,7 +602,76 @@ def parse_catalogue_page(html: str, site_url: str) -> list[dict]:
             "languages": languages,
             "synopsis": synopsis,
         })
+    if not results:
+        # V2.16 — le redesign a pu renommer les classes des cards :
+        # on tente l'extraction générique par liens /catalogue/<slug>/
+        results = _parse_catalogue_generic(html, site_url)
     return results
+
+
+def _parse_catalogue_generic(html: str, site_url: str) -> list[dict]:
+    """V2.16 — fallback générique si les classes strictes ont disparu.
+
+    Extrait tous les liens /catalogue/<slug>/ de la page (structure d'URL
+    stable du site, indépendante du design) et reconstruit des fiches
+    minimales : nom (img alt / h2 / h3 / texte / slug) et image (src de la
+    card, sinon reconstruction via le CDN jsdelivr utilisé partout :
+    cdn.jsdelivr.net/gh/Anime-Sama/IMG@img/contenu/<slug>.jpg).
+
+    Limites assumées : genres/langues/synopsis/catégories vides — les fiches
+    seront enrichies au prochain scrap avec les bons sélecteurs. Mieux vaut
+    un catalogue sans genres qu'un run entièrement mort.
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    soup = BeautifulSoup(html, "lxml")
+    for a in soup.find_all("a", href=True):
+        href = urljoin(site_url, a["href"].strip())
+        p = urlparse(href)
+        # rstrip("/") : les liens du site sont de la forme /catalogue/<slug>/
+        m = re.fullmatch(r"/catalogue/([^/?#]+)", p.path.rstrip("/"))
+        if not m:
+            continue
+        slug = m.group(1)
+        if not slug or slug.lower() in ("page", "search"):
+            continue
+        url = f"{p.scheme}://{p.netloc}/catalogue/{slug}/"
+        if url in seen:
+            continue
+        seen.add(url)
+
+        name = ""
+        img = a.find("img")
+        if img:
+            name = (img.get("alt") or "").strip()
+        if not name:
+            h = a.find(["h2", "h3", "p"])
+            if h:
+                name = h.get_text(strip=True)
+        if not name:
+            name = a.get_text(strip=True)
+        if not name:
+            name = slug.replace("-", " ").title()
+
+        image_url = (img.get("src") or "").strip() if img else ""
+        if not image_url:
+            image_url = f"https://cdn.jsdelivr.net/gh/Anime-Sama/IMG@img/contenu/{slug}.jpg"
+
+        out.append({
+            "url": url,
+            "image_url": image_url,
+            "name": name,
+            "alternative_names": [],
+            "genres": [],
+            "categories": set(),   # inconnues → le filtre Anime/Film les garde
+            "languages": set(),
+            "synopsis": "",
+        })
+    if out:
+        log.warning("parse_catalogue_page : 0 carte via sélecteurs stricts → "
+                    "fallback générique : %d fiches (genres/catégories vides, "
+                    "adapter les sélecteurs via debug_catalogue_*.html)", len(out))
+    return out
 
 
 async def fetch_all_catalogues(
@@ -521,7 +713,11 @@ async def fetch_all_catalogues(
                 seen_urls.add(cat["url"])
 
             cats = cat.get("categories", set())
-            if not (cats & {"Anime", "Film"}):
+            # V2.16 — cats VIDE = catégories inconnues (fallback générique) :
+            # on GARDE la fiche au lieu de la jeter (sinon tout le catalogue
+            # serait filtré en "scans" après un redesign). On ne filtre que
+            # les fiches explicitement classées hors Anime/Film.
+            if cats and not (cats & {"Anime", "Film"}):
                 scans_filtered += 1
                 continue
 
@@ -1020,7 +1216,7 @@ async def run_scraper(args):
         write_db(db_path, animes_out)
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump({"anime": animes_out}, f, ensure_ascii=False, indent=2)
-        return
+        return True
 
     client = ScraperClient()
 
@@ -1028,12 +1224,12 @@ async def run_scraper(args):
         site_url = await find_site_url(client)
         if not site_url:
             log.error("Abandon : domaine introuvable")
-            return
+            return False
 
         all_catalogues = await fetch_all_catalogues(client, site_url, max_animes)
         if not all_catalogues:
             log.error("Catalogue vide — abandon")
-            return
+            return False
 
         catalogues_to_scrape = all_catalogues
         if max_animes:
@@ -1055,50 +1251,76 @@ async def run_scraper(args):
         for idx, cat in enumerate(pbar, start=1):
             url = cat["url"]
             anime_id = stable_anime_id(url)
-            state["animes_scraped"][url] = {
-                "anime_id": anime_id,
-                "name": cat["name"],
-                "last_scraped": int(time.time()),
-            }
 
             short_name = cat["name"][:40] + ("..." if len(cat["name"]) > 40 else "")
             pbar.set_postfix_str(f"{short_name} [id={anime_id}]")
 
+            # V2.16 — ancienne entrée lue AVANT tout : l'entrée state n'est
+            # remplacée qu'après un scrape RÉUSSI. Avant, l'entrée était
+            # écrasée (last_scraped, sans data) AVANT le scrape → un échec
+            # aurait définitivement PERDU les données de l'anime du state.
+            old_entry = state["animes_scraped"].get(url) or {}
+            old_data = old_entry.get("data")
+
             try:
                 anime_data = await scrape_anime(client, cat, anime_id)
-                old_data = state["animes_scraped"][url].get("data")
-                if old_data:
-                    changes = []
-                    if old_data.get("title") != anime_data.get("title"):
-                        changes.append(f"titre changé")
-                    if old_data.get("description") != anime_data.get("description"):
-                        changes.append("description changée")
-                    if old_data.get("image") != anime_data.get("image"):
-                        changes.append("image changée")
-                    if set(old_data.get("genres", [])) != set(anime_data.get("genres", [])):
-                        changes.append("genres changés")
-                    old_eps = sum(len(s.get("episodes", [])) for s in old_data.get("seasons", []))
-                    new_eps = sum(len(s.get("episodes", [])) for s in anime_data.get("seasons", []))
-                    if new_eps > old_eps:
-                        changes.append(f"+{new_eps - old_eps} épisode(s)")
-                    old_seasons = len(old_data.get("seasons", []))
-                    new_seasons = len(anime_data.get("seasons", []))
-                    if new_seasons > old_seasons:
-                        changes.append(f"+{new_seasons - old_seasons} saison(s)")
-                    if changes:
-                        for change in changes:
-                            log.info("  → %s", change)
-                        updated_count += 1
-                    else:
-                        unchanged_count += 1
-                else:
-                    new_count += 1
-                state["animes_scraped"][url]["data"] = anime_data
-                animes_out.append(anime_data)
-                if idx % 10 == 0:
-                    save_state(state_path, state)
             except Exception as e:
                 log.error("  ✗ Erreur scrape %s : %s", url, e)
+                continue
+
+            # V2.16 — garde anti-corruption (redesign) : si le state a des
+            # saisons et que le nouveau scrap n'en trouve AUCUNE (parseur
+            # cassé par un changement CSS/JS, ex. panneauAnime renommé), on
+            # conserve les saisons précédentes au lieu d'écraser avec du vide.
+            if old_data and old_data.get("seasons") and not anime_data.get("seasons"):
+                log.warning("  ⚠ 0 saison détectée (state en avait %d) — "
+                            "saisons précédentes conservées (redesign du site ?)",
+                            len(old_data["seasons"]))
+                anime_data["seasons"] = old_data["seasons"]
+                anime_data["has_episodes"] = 1
+                langs_from_old = set()
+                for s_old in old_data["seasons"]:
+                    for ep_old in s_old.get("episodes", []):
+                        langs_from_old.update(ep_old.get("languages", []))
+                if langs_from_old:
+                    anime_data["languages"] = sorted(langs_from_old)
+
+            if old_data:
+                changes = []
+                if old_data.get("title") != anime_data.get("title"):
+                    changes.append(f"titre changé")
+                if old_data.get("description") != anime_data.get("description"):
+                    changes.append("description changée")
+                if old_data.get("image") != anime_data.get("image"):
+                    changes.append("image changée")
+                if set(old_data.get("genres", [])) != set(anime_data.get("genres", [])):
+                    changes.append("genres changés")
+                old_eps = sum(len(s.get("episodes", [])) for s in old_data.get("seasons", []))
+                new_eps = sum(len(s.get("episodes", [])) for s in anime_data.get("seasons", []))
+                if new_eps > old_eps:
+                    changes.append(f"+{new_eps - old_eps} épisode(s)")
+                old_seasons = len(old_data.get("seasons", []))
+                new_seasons = len(anime_data.get("seasons", []))
+                if new_seasons > old_seasons:
+                    changes.append(f"+{new_seasons - old_seasons} saison(s)")
+                if changes:
+                    for change in changes:
+                        log.info("  → %s", change)
+                    updated_count += 1
+                else:
+                    unchanged_count += 1
+            else:
+                new_count += 1
+
+            state["animes_scraped"][url] = {
+                "anime_id": anime_id,
+                "name": cat["name"],
+                "last_scraped": int(time.time()),
+                "data": anime_data,
+            }
+            animes_out.append(anime_data)
+            if idx % 10 == 0:
+                save_state(state_path, state)
         pbar.close()
 
         state["catalogue_seen_urls"] = [c["url"] for c in all_catalogues]
@@ -1123,6 +1345,7 @@ async def run_scraper(args):
             client.req_count, new_count, updated_count, unchanged_count,
             len(animes_out), int(time.time()) - start_time,
         )
+        return True
     finally:
         client.close()
 
@@ -1169,39 +1392,62 @@ def main():
             log.warning("Pull HF impossible (%s: %s) — demarrage avec le state local",
                         type(e).__name__, e)
 
-    asyncio.run(run_scraper(args))
+    ok = asyncio.run(run_scraper(args))
+
+    # V2.16 — push guard : avant, un run en échec (domaine introuvable,
+    # catalogue vide) poussait QUAND MÊME le state périmé + exit 0 →
+    # run_scrape voyait « Fallback réussi » et la CI restait verte pendant
+    # que rien ne scrait depuis des semaines. Maintenant :
+    #   - échec + --push → push de state.json SEUL (progression partielle
+    #     préservée — c'est un sur-ensemble du state tiré), JAMAIS de DB
+    #     partielle ni de manifest trompeur, puis exit 1.
+    #   - succès (ou --no-scrap) → push complet comme avant.
+    failed = not ok and not args.no_scrap
 
     if args.push and hf_api:
-        log.info("Push des resultats sur HF ...")
-        if os.path.exists(args.db):
-            hf_api.upload_file(path_or_fileobj=args.db, path_in_repo="animezone.db", repo_id=hf_repo, repo_type="dataset")
-            log.info("✓ animezone.db pousse")
-        if os.path.exists(args.state):
-            hf_api.upload_file(path_or_fileobj=args.state, path_in_repo="state.json", repo_id=hf_repo, repo_type="dataset")
-            log.info("✓ state.json pousse")
-        import sqlite3, time
-        if os.path.exists(args.db):
-            conn = sqlite3.connect(args.db)
-            c = conn.cursor()
-            import hashlib as _hl
-            sha256 = _hl.sha256()
-            with open(args.db, "rb") as f:
-                for chunk in iter(lambda: f.read(65536), b""):
-                    sha256.update(chunk)
-            manifest = {
-                "db_version": int(time.time()),
-                "last_update": int(time.time()),
-                "total_animes": c.execute("SELECT COUNT(*) FROM anime").fetchone()[0],
-                "total_episodes": c.execute("SELECT COUNT(*) FROM episode").fetchone()[0],
-                "total_urls": c.execute("SELECT COUNT(*) FROM episode_url").fetchone()[0],
-                "db_sha256": sha256.hexdigest(),
-            }
-            conn.close()
-            with open("/tmp/manifest.json", "w") as f:
-                json.dump(manifest, f, indent=2)
-            hf_api.upload_file(path_or_fileobj="/tmp/manifest.json", path_in_repo="manifest.json", repo_id=hf_repo, repo_type="dataset")
-            log.info("✓ manifest.json pousse: %d animes, %d eps, sha256=%s...",
-                     manifest["total_animes"], manifest["total_episodes"], manifest["db_sha256"][:16])
+        if failed:
+            log.warning("Scrap en échec — push de state.json seul "
+                        "(progression partielle), DB/manifest sautés")
+            if os.path.exists(args.state):
+                hf_api.upload_file(path_or_fileobj=args.state,
+                                   path_in_repo="state.json",
+                                   repo_id=hf_repo, repo_type="dataset")
+                log.info("✓ state.json pousse")
+        else:
+            log.info("Push des resultats sur HF ...")
+            if os.path.exists(args.db):
+                hf_api.upload_file(path_or_fileobj=args.db, path_in_repo="animezone.db", repo_id=hf_repo, repo_type="dataset")
+                log.info("✓ animezone.db pousse")
+            if os.path.exists(args.state):
+                hf_api.upload_file(path_or_fileobj=args.state, path_in_repo="state.json", repo_id=hf_repo, repo_type="dataset")
+                log.info("✓ state.json pousse")
+            import sqlite3, time
+            if os.path.exists(args.db):
+                conn = sqlite3.connect(args.db)
+                c = conn.cursor()
+                import hashlib as _hl
+                sha256 = _hl.sha256()
+                with open(args.db, "rb") as f:
+                    for chunk in iter(lambda: f.read(65536), b""):
+                        sha256.update(chunk)
+                manifest = {
+                    "db_version": int(time.time()),
+                    "last_update": int(time.time()),
+                    "total_animes": c.execute("SELECT COUNT(*) FROM anime").fetchone()[0],
+                    "total_episodes": c.execute("SELECT COUNT(*) FROM episode").fetchone()[0],
+                    "total_urls": c.execute("SELECT COUNT(*) FROM episode_url").fetchone()[0],
+                    "db_sha256": sha256.hexdigest(),
+                }
+                conn.close()
+                with open("/tmp/manifest.json", "w") as f:
+                    json.dump(manifest, f, indent=2)
+                hf_api.upload_file(path_or_fileobj="/tmp/manifest.json", path_in_repo="manifest.json", repo_id=hf_repo, repo_type="dataset")
+                log.info("✓ manifest.json pousse: %d animes, %d eps, sha256=%s...",
+                         manifest["total_animes"], manifest["total_episodes"], manifest["db_sha256"][:16])
+
+    if failed:
+        log.critical("Run en échec — exit 1 (run_scrape / CI doit voir l'échec)")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

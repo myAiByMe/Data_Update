@@ -104,9 +104,11 @@ UA_CHROME = (
 
 IMPERSONATIONS = ["chrome131", "chrome124", "safari17_0", "firefox133"]
 
-# Domaines anime-sama (testés en live : .fr/.eu n'existent pas, .to actif)
-SAMA_DOMAINS = ["https://anime-sama.to/", "https://anime-sama.org/",
-                "https://anime-sama.si/", "https://anime-sama.tv/"]
+# Domaines anime-sama (V2.16 : .to est le canonique, les miroirs y
+# redirigent ; .eu est DNS-mort mais coût ~0 grâce au skip DNS de scrap.py)
+SAMA_DOMAINS = ["https://anime-sama.to/", "https://anime-sama.si/",
+                "https://anime-sama.tv/", "https://anime-sama.org/",
+                "https://anime-sama.eu/"]
 
 # Sources de listes de proxys HTTP publics (gratuites, sans clé)
 PROXY_SOURCES = [
@@ -768,13 +770,34 @@ class _CompatSession:
 # find_site_url hybride (sans accès _sessions direct)
 # ------------------------------------------------------------------
 async def find_site_url_hybrid(client) -> str | None:
+    """V2.16 — même détection design-indépendante que scrap.find_site_url.
+
+    L'ancien test comptait 'class="card-title"' sur /catalogue/?search= : ce
+    marqueur a disparu avec le redesign d'oct. 2026 → les 4 domaines répondaient
+    en direct (verdict ok, pas d'escalade — cf. stats direct=4 cookies=0
+    proxys=0 relais=0 des logs) mais étaient déclarés morts. On valide
+    maintenant la page par identité du site, puis on résout le canonique
+    via la redirection (.si/.tv/.org → .to) pour des anime_id stables.
+    """
     log.info("Recherche du domaine actif anime-sama (cascade anti-CF)…")
+    debug_dumped = False
     for base in SAMA_DOMAINS:
-        html = await client.get(base + "catalogue/?search=")
-        if html and 'class="card-title"' in html:
-            log.info("  ✓ Domaine actif : %s", base)
-            return base
-        log.info("  ✗ %s inaccessible", base)
+        test_url = base + "catalogue/?search="
+        html = await client.get(test_url)
+        if not scrap._page_alive(html):
+            log.info("  ✗ %s inaccessible (offline / challenge CF / page vide)", base)
+            continue
+        site_url = scrap._resolve_canonical(client, test_url, base)
+        old_markers = [m for m in scrap.CARD_MARKERS if html.count(m) > 0]
+        if not old_markers and not debug_dumped:
+            log.warning("  ⚠ %s répond mais 0 marqueur carte connu "
+                        "(card-title/catalog-card) — design changé ?", site_url)
+            scrap._dump_debug_html(
+                html, urllib.parse.urlparse(site_url).netloc.replace(".", "_"))
+            debug_dumped = True
+        log.info("  ✓ Domaine actif : %s (marqueurs: %s)", site_url,
+                 ", ".join(old_markers) if old_markers else "AUCUN (redesign)")
+        return site_url
     log.error("Aucun domaine Anime-Sama accessible")
     return None
 
