@@ -5,6 +5,20 @@ scrap_experimental.py — Scraper Anime-Sama avec bypass Cloudflare en cascade.
 
 OBJECTIF : éliminer les erreurs 403 sur les GitHub Runners (8/9 bloqués).
 
+V2.17 — Constats du diagnostic Codespace (2026-10-28) intégrés :
+  · DNS-mort : skip immédiat côté curl_cffi aussi ("Could not resolve
+    host" = curl (6)) — .eu ne coûte plus ~21 s de retries.
+  · classify_response : scan INTÉGRAL des petites pages (< 8 Ko) servies
+    status 200 (blocs CF "Attention Required" = 4,5 Ko) + nouveaux
+    marqueurs (cf_chl_, turnstile, "verifying you are human").
+  · find_site_url_hybrid : ESCALADE RÉELLE par rounds — avant, des
+    réponses 200 non-anime-sama passaient classify « ok » + _validate
+    « ok » et mouraient sur _page_alive SANS jamais escalader (stats
+    direct=4 cookies=0 proxys=0 relais=0). Maintenant : si tous les
+    domaines sont morts en direct, on force cookies → proxys → relais.
+  · Referer + Sec-Fetch sur les .js (comme scrap.py V2.17).
+  · 4 réponses 200 non valides d'affilée (direct/cookies) → escalade.
+
 STRATÉGIE EN 4 NIVEAUX (escalade automatique) :
   1. DIRECT    : curl_cffi avec impersonation TLS d'un vrai navigateur
                  (Chrome 131). Passe sur les runners dont l'IP n'est pas
@@ -120,9 +134,25 @@ PROXY_SOURCES = [
 
 RE_CHALLENGE = re.compile(
     r"just a moment|attention required|challenge-platform|cf-browser-verification"
-    r"|enable javascript and cookies|cloudflare-nginx",
+    r"|enable javascript and cookies|cloudflare-nginx|cf_chl_[a-z_]*"
+    r"|cf-turnstile|checking your browser|verifying you are human",
     re.IGNORECASE,
 )
+
+# V2.16.1 — firewall DUR CF ("Sorry, you have been blocked", error 1020…) :
+# PAS un challenge résolvable → classé "blocked" d'emblée pour escalader
+# DIRECTEMENT vers proxys/relais sans perdre 30-60 s sur un solve navigateur.
+RE_CF_BLOCK_HARD = re.compile(
+    r"error code: ?\d{4}|you have been blocked|cf-error-details|\bbanned\b",
+    re.IGNORECASE,
+)
+
+# V2.16.1 — pages d'erreur firewall CF (IP bannie) : "error code: 1020" etc.
+# Servies parfois AVEC status 200 → indisociables d'une vraie page par le
+# statut seul. Une vraie page anime-sama fait toujours > 10 Ko ; une page
+# < 8 Ko à marqueur CF = bloc.
+RE_CF_ERROR = re.compile(r"error code: ?\d{4}|\bbanned\b|\bblocked\b.{0,40}cloudflare",
+                         re.IGNORECASE)
 
 RELAY_DELAY = 0.8    # délai entre requêtes via relais (politesse)
 PROXY_DELAY = 0.6    # délai entre requêtes via proxys
@@ -137,12 +167,30 @@ PROXY_TIMEOUT = 25   # s — timeout requête via proxy (chaud ou PROXY_URL)
 
 def classify_response(status: int, text: str) -> str:
     """ok | challenge | blocked | ratelimit | error"""
-    snippet = text[:2000] if text else ""
+    if not text:
+        return "error"
+    snippet = text[:3000]
+    # V2.17 — CF sert parfois ses pages bloc/challenge AVEC status 200
+    # (constat runners Actions : direct=4 sans escalade). Deux cas :
+    #   · page < 8 Ko → scan INTÉGRAL : le bloc dur "Attention Required"
+    #     fait ~4,5 Ko et ses marqueurs peuvent être au-delà de 3 000 o ;
+    #   · page >= 8 Ko → scan de la zone <title> seulement (le vrai
+    #     contenu anime-sama fait 40-600 Ko et ne matche jamais ces
+    #     marqueurs en tête de page ; un <noscript> situé plus bas ne
+    #     doit pas faire classer une vraie page comme challenge).
     if status == 200:
-        if len(text) < 50 and RE_CHALLENGE.search(snippet):
-            return "challenge"
+        if len(text) < 8000:
+            if RE_CF_BLOCK_HARD.search(text):
+                return "blocked"
+            if RE_CHALLENGE.search(text):
+                return "challenge"
+            return "ok"
+        if RE_CF_BLOCK_HARD.search(snippet):
+            return "blocked"
         return "ok"
     if status in (403, 503):
+        if RE_CF_BLOCK_HARD.search(text):
+            return "blocked"
         if RE_CHALLENGE.search(snippet):
             return "challenge"
         return "blocked"
@@ -191,7 +239,11 @@ class ProxyStream:
     PROBE_URL = "https://anime-sama.to/404-inexistant/"
     PROBE_NEEDLE = "Accès Introuvable"
     PROBE2_URL = "https://anime-sama.to/catalogue/"
-    PROBE2_NEEDLE = "card-title"
+    # V2.16.1 — "card-title" a disparu avec le redesign d'oct. 2026 : les
+    # proxys n'auraient plus JAMAIS été validés (liste chaude vide → cascade
+    # niveau 3 morte). "anime-sama" = identité du site, présente quel que
+    # soit le design.
+    PROBE2_NEEDLE = "anime-sama"
 
     def __init__(self):
         self.hot: list[dict] = []          # {"proxy", "busy", "last_ok"}
@@ -236,7 +288,11 @@ class ProxyStream:
             t0 = time.monotonic()
             r = s.get(self.PROBE_URL, timeout=12,
                       headers={"Accept-Language": "fr-FR,fr;q=0.9"})
-            if not (r.status_code == 404 and self.PROBE_NEEDLE in r.text):
+            # V2.16.1 — tolérance redesign : le texte de la 404 a pu changer.
+            # Une vraie 404 du site reste petite (< 5 Ko) ; un challenge/bloc
+            # CF fait 5-6 Ko+ avec un statut 403/503 → toujours rejeté ici.
+            if not (r.status_code == 404
+                    and (self.PROBE_NEEDLE in r.text or len(r.text) < 5000)):
                 s.close()
                 return None
             r = s.get(self.PROBE2_URL, timeout=20,
@@ -468,6 +524,8 @@ class HybridClient:
         # niveau 3 : ProxyStream (ou PROXY_URL fixe s'il est fourni)
         self._stream = None if (NO_PROXYSTREAM or PROXY_URL) else ProxyStream()
         self._empty_streak = 0
+        self._dns_dead: set[str] = set()   # V2.17 — hosts DNS introuvables
+        self._suspect_streak = 0           # V2.17 — 200 ok mais contenu invalide
 
         self.req_count = 0
         self.stats = {"direct": 0, "cookies": 0, "proxy": 0, "relay": 0,
@@ -482,7 +540,8 @@ class HybridClient:
             return s
 
     # ---------------- niveaux 1/2 : curl_cffi (direct ou cookies) --------
-    async def _curl_get(self, url: str, timeout: int = 30):
+    async def _curl_get(self, url: str, timeout: int = 30,
+                        referer: str | None = None):
         session = await self._get_session()
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -490,6 +549,13 @@ class HybridClient:
         }
         if self._mode == "cookies" and self._ua:
             headers["User-Agent"] = self._ua
+        # V2.17 — Referer/Sec-Fetch sur les .js (episodes.js filtré sans)
+        if referer:
+            headers["Referer"] = referer
+            headers["Sec-Fetch-Site"] = "same-origin"
+            if ".js" in url:
+                headers["Sec-Fetch-Dest"] = "script"
+                headers["Sec-Fetch-Mode"] = "no-cors"
         resp = await asyncio.to_thread(
             session.get, url,
             headers=headers,
@@ -632,7 +698,8 @@ class HybridClient:
             # mode relay : rien à faire, rotation gérée par _relay_get
 
     # ---------------- interface publique ----------------
-    async def get(self, url: str, *, retry: int = 6) -> str:
+    async def get(self, url: str, *, retry: int = 6,
+                  referer: str | None = None) -> str:
         async with self._concurrency:
             if self._mode == "proxy":
                 retry = max(retry, PROXY_ATTEMPTS)
@@ -644,7 +711,7 @@ class HybridClient:
                 elapsed = None
                 try:
                     if self._mode in ("direct", "cookies"):
-                        status, text = await self._curl_get(url)
+                        status, text = await self._curl_get(url, referer=referer)
                         self.req_count += 1
                         self.stats["direct" if self._mode == "direct" else "cookies"] += 1
                     elif self._mode == "proxy":
@@ -703,11 +770,22 @@ class HybridClient:
                     if verdict == "ok":
                         validated = self._validate(url, text)
                         if validated is not None:
+                            self._suspect_streak = 0
                             if entry is not None:
                                 await self._stream.report(entry, True, elapsed)
                             return validated
                         if entry is not None:
                             await self._stream.report(entry, False)
+                        # V2.17 — 200 « ok » mais contenu non valide en boucle
+                        # (page coquille sans identité, proxy piégé) : ne pas
+                        # brûler les 6 retries au même niveau → escalade après 4
+                        self._suspect_streak += 1
+                        if (self._suspect_streak >= 4
+                                and self._mode in ("direct", "cookies")):
+                            self._suspect_streak = 0
+                            log.warning("4 réponses 200 non valides consécutives "
+                                        "→ escalade (mode=%s)", self._mode)
+                            await self._escalate(url)
                         continue  # contenu suspect (page quasi vide) → retry
                     if verdict in ("challenge", "blocked"):
                         if DEBUG_CF:
@@ -723,6 +801,20 @@ class HybridClient:
                     # ratelimit / error → backoff
                     await asyncio.sleep(2 ** attempt + random.uniform(0, 1))
                 except Exception as e:
+                    # V2.17 — DNS-mort : même skip immédiat que scrap.py, mais
+                    # pour les erreurs curl_cffi ("Could not resolve host" =
+                    # curl (6)) — .eu coûtait ~21 s en 6 retries sinon.
+                    msg = str(e).lower()
+                    if ("could not resolve host" in msg
+                            or "getaddrinfo" in msg
+                            or "no address associated" in msg
+                            or "name or service not known" in msg
+                            or "nodename nor servname" in msg):
+                        host = urllib.parse.urlparse(url).netloc or url
+                        if host not in self._dns_dead:
+                            self._dns_dead.add(host)
+                            log.error("DNS introuvable pour %s — domaine mort, skip", host)
+                        return ""
                     log.warning("Erreur réseau %s: %s", url[:60], str(e)[:70])
                     await asyncio.sleep(1 + random.uniform(0, 1))
             log.error("Échec définitif après %d retries : %s", retry, url[:70])
@@ -769,35 +861,79 @@ class _CompatSession:
 # ------------------------------------------------------------------
 # find_site_url hybride (sans accès _sessions direct)
 # ------------------------------------------------------------------
-async def find_site_url_hybrid(client) -> str | None:
-    """V2.16 — même détection design-indépendante que scrap.find_site_url.
+def _can_escalate_more(client) -> bool:
+    """V2.17 — reste-t-il un niveau supérieur dans la cascade ?"""
+    can_proxy = (client._stream is not None) or bool(PROXY_URL)
+    if client._mode == "direct":
+        return True
+    if client._mode == "cookies":
+        return can_proxy or not NO_RELAY
+    if client._mode == "proxy":
+        return not NO_RELAY
+    return False
 
-    L'ancien test comptait 'class="card-title"' sur /catalogue/?search= : ce
-    marqueur a disparu avec le redesign d'oct. 2026 → les 4 domaines répondaient
-    en direct (verdict ok, pas d'escalade — cf. stats direct=4 cookies=0
-    proxys=0 relais=0 des logs) mais étaient déclarés morts. On valide
-    maintenant la page par identité du site, puis on résout le canonique
-    via la redirection (.si/.tv/.org → .to) pour des anime_id stables.
+
+async def find_site_url_hybrid(client) -> str | None:
+    """V2.17 — détection design-indépendante + ESCALADE RÉELLE par rounds.
+
+    Constat CI 2026-10-28 : les runners Actions reçoivent status 200 + une
+    page qui n'est NI anime-sama NI un challenge reconnu → classify « ok »,
+    _validate « ok » (page > 100 o), puis _page_alive la déclare morte —
+    SANS AUCUNE escalade (stats direct=4 cookies=0 proxys=0 relais=0).
+    Maintenant : après un round complet de domaines morts, on force
+    _escalate (cookies → proxys → relais) et on re-teste, tant qu'un
+    niveau supérieur existe. Chaque réponse 200 non valide est expliquée
+    et la première est dumpée (debug_catalogue_*_dead.html).
     """
     log.info("Recherche du domaine actif anime-sama (cascade anti-CF)…")
     debug_dumped = False
-    for base in SAMA_DOMAINS:
-        test_url = base + "catalogue/?search="
-        html = await client.get(test_url)
-        if not scrap._page_alive(html):
-            log.info("  ✗ %s inaccessible (offline / challenge CF / page vide)", base)
-            continue
-        site_url = scrap._resolve_canonical(client, test_url, base)
-        old_markers = [m for m in scrap.CARD_MARKERS if html.count(m) > 0]
-        if not old_markers and not debug_dumped:
-            log.warning("  ⚠ %s répond mais 0 marqueur carte connu "
-                        "(card-title/catalog-card) — design changé ?", site_url)
-            scrap._dump_debug_html(
-                html, urllib.parse.urlparse(site_url).netloc.replace(".", "_"))
-            debug_dumped = True
-        log.info("  ✓ Domaine actif : %s (marqueurs: %s)", site_url,
-                 ", ".join(old_markers) if old_markers else "AUCUN (redesign)")
-        return site_url
+    round_no = 0
+    test_url = SAMA_DOMAINS[0] + "catalogue/?search="
+    while round_no < 4:
+        round_no += 1
+        if round_no > 1:
+            log.info("── Round %d : mode=%s ──", round_no, client._mode)
+        for base in SAMA_DOMAINS:
+            test_url = base + "catalogue/?search="
+            html = await client.get(test_url)
+            if scrap._page_alive(html):
+                site_url = scrap._resolve_canonical(client, test_url, base)
+                old_markers = [m for m in scrap.CARD_MARKERS if html.count(m) > 0]
+                if not old_markers and not debug_dumped:
+                    log.warning("  ⚠ %s répond mais 0 marqueur carte connu "
+                                "(card-title/catalog-card) — design changé ?", site_url)
+                    scrap._dump_debug_html(
+                        html, urllib.parse.urlparse(site_url).netloc.replace(".", "_"))
+                    debug_dumped = True
+                log.info("  ✓ Domaine actif : %s (marqueurs: %s)", site_url,
+                         ", ".join(old_markers) if old_markers else "AUCUN (redesign)")
+                return site_url
+            if html:
+                # V2.17 — réponse 200 non valide : EXPLIQUER + dumper (preuve)
+                if not debug_dumped:
+                    low = html.lower()
+                    why = []
+                    if len(html) < 3000:
+                        why.append(f"page trop petite ({len(html)} o)")
+                    if scrap._is_cf_challenge(html):
+                        why.append("marqueurs challenge CF")
+                    if "anime-sama" not in low and "/catalogue/" not in low:
+                        why.append("sans identité anime-sama")
+                    log.warning("  ✗ %s : réponse 200 non valide (%s)", base,
+                                " + ".join(why) or "raison inconnue")
+                    scrap._dump_debug_html(
+                        html, urllib.parse.urlparse(base).netloc.replace(".", "_") + "_dead")
+                    debug_dumped = True
+            else:
+                log.info("  ✗ %s inaccessible (offline / DNS / bloc — voir logs)", base)
+        if not _can_escalate_more(client):
+            break
+        try:
+            await client._escalate(test_url)
+        except Exception as e:
+            log.warning("Escalade impossible (%s: %s) — arrêt cascade",
+                        type(e).__name__, e)
+            break
     log.error("Aucun domaine Anime-Sama accessible")
     return None
 

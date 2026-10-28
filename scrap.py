@@ -1,6 +1,30 @@
 #!/usr/bin/env python3
 """Scraper Anime-Sama (anime-sama.to) avec cloudscraper.
 
+V2.17 — Anti-ban Cloudflare + observabilité (conclusions du diagnostic
+Codespace du 2026-10-28, IP 20.227.141.209 / AS8075 Microsoft) :
+  - LE SITE N'A PAS CHANGÉ de structure : /catalogue/?search= = 200 +
+    48 liens /catalogue/<slug>/, pages anime (panneauAnime) et saisons
+    (episodes.js) intactes. Le blocage CI est 100 % IP/réputation : les
+    IP des runners GitHub Actions sont pré-flaggées par Cloudflare
+    (bloc dur "Attention Required" ~4,5 Ko, non résolvable côté IP).
+  - Même une IP PROPRE se fait bannir après ~25 requêtes rapides
+    (episodes.js → 403 en 65 ms) → pacing par défaut relevé :
+    SAMA_DELAY=0.8 s (avant 0.3) et SAMA_POOL=2 sessions (avant 4).
+  - Referer + Sec-Fetch sur les .js (episodes.js filtré sans Referer).
+  - Firewall dur CF ("Attention Required"/error code 1020) : cooldown
+    unique SAMA_COOLDOWN (60 s) puis skip immédiat — retry même IP
+    inutile (avant : 3 retries × 5-15 s par URL = temps perdu).
+  - Scan anti-challenge-déguisé : page < 8 Ko à marqueurs CF servie
+    avec status 200 = bloc/challenge (les vraies pages font 40-600 Ko).
+  - _dump_block_once : la PREMIÈRE page bloc/challenge est sauvée
+    (debug_block_*.html) et loguée (300 premiers octets) → le prochain
+    run CI montrera EXACTEMENT ce que le runner reçoit.
+  - find_site_url : toute réponse non valide est expliquée (trop petite
+    / marqueurs CF / sans identité anime-sama) + dumpée.
+  - PROXY_URL (env) : route toutes les sessions via un proxy → le
+    contournement fiable quand l'IP du runner est pré-flaggée.
+
 V2.16 — Fix « Aucun domaine Anime-Sama accessible » après redesign oct. 2026 :
   - Détection de domaine design-INDÉPENDANTE : on ne compte plus
     'class="card-title"' (marqueur disparu avec le redesign) mais on valide
@@ -66,7 +90,25 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("cloudscraper").setLevel(logging.WARNING)
 log = logging.getLogger("scrap")
 
-REQUEST_DELAY = 0.3
+# V2.17 — pacing anti-ban réglable par variables d'environnement :
+#   SAMA_DELAY    délai de base entre 2 requêtes d'un même worker (s)
+#   SAMA_POOL     nb de sessions parallèles (2 × 0,8 s ≈ 2,5 req/s max)
+#   SAMA_COOLDOWN pause unique appliquée au 1er firewall CF détecté (s)
+#   PROXY_URL     proxy HTTP(S) ex "http://user:pass@host:port" — contourne
+#                 définitivement l'IP-flag des runners Actions si fourni
+REQUEST_DELAY = float(os.environ.get("SAMA_DELAY", "0.8"))
+CF_BAN_COOLDOWN = int(os.environ.get("SAMA_COOLDOWN", "60"))
+PROXY_URL = os.environ.get("PROXY_URL", "").strip()
+
+# V2.17 — marqueurs CF recherchés dans les PETITES pages (< 8 Ko) servies
+# avec status 200 (les vraies pages anime-sama font 40-600 Ko ; les pages
+# de bloc CF font 4-6 Ko et les challenges 8-20 Ko selon la version).
+RE_CF_SMALL = re.compile(
+    r"challenge-platform|cf_chl_[a-z_]*|cf-turnstile|cf-browser-verification"
+    r"|just a moment|attention required|you have been blocked"
+    r"|error code: ?\d{4}|checking your browser|verifying you are human",
+    re.IGNORECASE,
+)
 
 SCHEMA = """
 CREATE TABLE anime (
@@ -305,21 +347,31 @@ def split_and_strip(string: str, delimiters) -> list[str]:
 
 
 class ScraperClient:
-    """Pool de sessions cloudscraper pour bypass Cloudflare + parallélisme."""
+    """Pool de sessions cloudscraper pour bypass Cloudflare + parallélisme.
 
-    POOL_SIZE = 4
+    V2.17 : POOL_SIZE=2 par défaut (env SAMA_POOL) — 4 sessions × 0,3 s
+    équivalaient à ~13 req/s, un pattern de bot qui déclenche le firewall
+    CF au bout de quelques centaines de requêtes. 2 × 0,8 s ≈ 2,5 req/s.
+    PROXY_URL (env) route toutes les sessions via un proxy HTTP/S.
+    """
+
+    POOL_SIZE = int(os.environ.get("SAMA_POOL", "2"))
 
     def __init__(self):
-        self._sessions = [
-            cloudscraper.create_scraper(
+        proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+        self._sessions = []
+        for _ in range(self.POOL_SIZE):
+            s = cloudscraper.create_scraper(
                 browser={"browser": "chrome", "platform": "windows", "mobile": False}
             )
-            for _ in range(self.POOL_SIZE)
-        ]
+            if proxies:
+                s.proxies = proxies
+            self._sessions.append(s)
         self._session_idx = 0
         self._session_lock = asyncio.Lock()
         self.req_count = 0
         self._concurrency = asyncio.Semaphore(self.POOL_SIZE)
+        self._banned_cooldown_done = False
 
     async def _get_session(self):
         async with self._session_lock:
@@ -327,20 +379,32 @@ class ScraperClient:
             self._session_idx = (self._session_idx + 1) % self.POOL_SIZE
             return session
 
-    async def get(self, url: str, *, retry: int = 3) -> str:
+    async def get(self, url: str, *, retry: int = 3,
+                  referer: str | None = None) -> str:
         async with self._concurrency:
             for attempt in range(retry):
-                await asyncio.sleep(REQUEST_DELAY)
+                # V2.17 — jitter ±30 % : plus humain qu'un délai fixe
+                await asyncio.sleep(REQUEST_DELAY * random.uniform(0.7, 1.3))
                 try:
                     session = await self._get_session()
+                    headers = {
+                        "User-Agent": USER_AGENT,
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.5",
+                    }
+                    # V2.17 — Referer/Sec-Fetch sur les assets (.js) : le diag
+                    # Codespace montre episodes.js → 403 firewall sans Referer
+                    # (le HTML passe). Mimique navigateur minimale.
+                    if referer:
+                        headers["Referer"] = referer
+                        headers["Sec-Fetch-Site"] = "same-origin"
+                        if ".js" in url:
+                            headers["Sec-Fetch-Dest"] = "script"
+                            headers["Sec-Fetch-Mode"] = "no-cors"
                     resp = await asyncio.to_thread(
                         session.get,
                         url,
-                        headers={
-                            "User-Agent": USER_AGENT,
-                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                            "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.5",
-                        },
+                        headers=headers,
                         timeout=30,
                     )
                     self.req_count += 1
@@ -349,17 +413,45 @@ class ScraperClient:
                         log.warning("HTTP %d sur %s — retry dans %.1fs", resp.status_code, url, wait)
                         await asyncio.sleep(wait)
                         continue
-                    title_match = re.search(r"<title>([^<]+)</title>", resp.text, re.IGNORECASE)
+                    text = resp.text
+                    title_match = re.search(r"<title>([^<]+)</title>", text[:6000], re.IGNORECASE)
                     title = title_match.group(1).lower() if title_match else ""
-                    # V2.16 — "just a moment" ajouté (interstitiel CF qui
-                    # passait au travers et était renvoyé comme du HTML ok)
-                    if ("blocked" in title or "attention required" in title
-                            or "just a moment" in title):
+                    # V2.17 — CF sert parfois challenge/bloc AVEC status 200.
+                    # Une vraie page anime-sama fait 40-600 Ko : une page < 8 Ko
+                    # à marqueurs CF est un bloc/challenge déguisé, même title OK.
+                    small = text[:8000].lower() if len(text) < 8000 else ""
+                    soft_challenge = ("just a moment" in title
+                                      or "challenge-platform" in small
+                                      or "cf_chl_" in small
+                                      or "cf-turnstile" in small
+                                      or "checking your browser" in small
+                                      or "verifying you are human" in small)
+                    hard_block = ("attention required" in title
+                                  or "error code:" in title
+                                  or "you have been blocked" in small)
+                    # V2.17 — firewall DUR ("Attention Required", error 1020) :
+                    # IP bannie, PAS un challenge résolvable → cooldown unique
+                    # (un ban par taux peut retomber) puis skip immédiat.
+                    if hard_block:
+                        _dump_block_once(text, url)
+                        if not self._banned_cooldown_done:
+                            self._banned_cooldown_done = True
+                            log.error("🔥 Firewall CF (IP bannie) sur %s — "
+                                      "cooldown unique %ds puis reprise (IP Actions "
+                                      "souvent pré-flaggée ; PROXY_URL propre = "
+                                      "contournement fiable)", url, CF_BAN_COOLDOWN)
+                            await asyncio.sleep(CF_BAN_COOLDOWN)
+                            continue
+                        log.error("Firewall CF persistant sur %s — skip "
+                                  "(retry même IP inutile, le fallback "
+                                  "expérimental escaladera)", url)
+                        return ""
+                    if soft_challenge:
+                        _dump_block_once(text, url)
                         wait = 5 + attempt * 5
-                        log.warning("Cloudflare block sur %s — retry dans %ds", url, wait)
+                        log.warning("Challenge Cloudflare sur %s — retry dans %ds", url, wait)
                         await asyncio.sleep(wait)
                         continue
-                    text = resp.text
                     if ".js" in url:
                         if len(text) < 30 and "eps" not in text:
                             await asyncio.sleep(2)
@@ -451,6 +543,33 @@ def _dump_debug_html(html: str, tag: str):
         pass
 
 
+_BLOCK_DUMPED = False
+
+
+def _dump_block_once(text: str, url: str):
+    """V2.17 — sauve UNE fois la première page bloc/challenge CF rencontrée.
+
+    Objectif : le prochain run CI montre dans ses logs (300 premiers octets)
+    et en artefact (debug_block_*.html) EXACTEMENT ce que l'IP du runner
+    reçoit — plus jamais de « inaccessible » sans preuve. Le diagnostic
+    Codespace a montré le bloc dur type : title "Attention Required! |
+    Cloudflare", ~4,5 Ko, "error code: 1010/1020".
+    """
+    global _BLOCK_DUMPED
+    if _BLOCK_DUMPED or not text:
+        return
+    _BLOCK_DUMPED = True
+    try:
+        host = (urlparse(url).netloc or "site").replace(".", "_")
+        fn = f"debug_block_{host}.html"
+        with open(fn, "w", encoding="utf-8", errors="replace") as f:
+            f.write(text[:200_000])
+        log.error("🔥 PAGE CF CAPTURÉE → %s | head: %r",
+                  fn, text[:300].replace("\n", " "))
+    except Exception:
+        pass
+
+
 def _resolve_canonical(client, test_url: str, fallback: str) -> str:
     """Suit la redirection du test et retourne l'ORIGINE finale.
 
@@ -482,7 +601,26 @@ async def find_site_url(client: ScraperClient) -> str | None:
         test_url = url + "catalogue/?search="
         html = await client.get(test_url)
         if not _page_alive(html):
-            log.info("  ✗ %s inaccessible (offline / challenge CF / page vide)", url)
+            # V2.17 — explication + dump : distinguer offline/DNS (html vide)
+            # d'une réponse 200 non valide (page coquille / challenge CF
+            # déguisé) qu'on ne savait pas voir avant.
+            if html:
+                why = []
+                if len(html) < 3000:
+                    why.append(f"page trop petite ({len(html)} o)")
+                if _is_cf_challenge(html):
+                    why.append("marqueurs challenge CF")
+                low = html.lower()
+                if "anime-sama" not in low and "/catalogue/" not in low:
+                    why.append("sans identité anime-sama")
+                log.warning("  ✗ %s : réponse non valide (%s)", url,
+                            " + ".join(why) or "raison inconnue")
+                if not debug_dumped:
+                    _dump_debug_html(html, urlparse(url).netloc.replace(".", "_") + "_dead")
+                    debug_dumped = True
+            else:
+                log.info("  ✗ %s inaccessible (offline / DNS / challenge / "
+                         "bloc — voir logs + debug_block_*.html ci-dessus)", url)
             continue
 
         # Vivant → canonique via redirection (ex: .si → .to)
@@ -807,7 +945,7 @@ async def fetch_season_lang_page(
         js_url = page_url + match_url.group(0)
     else:
         js_url = page_url + script_tag["src"]
-    js_html = await client.get(js_url)
+    js_html = await client.get(js_url, referer=page_url)
     if not js_html:
         return html, ""
     return html, js_html
